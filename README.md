@@ -2,14 +2,142 @@
 
 ## 一、JUC 概览
 ### 1.1 JUC 包的由来与作用
+
+**JDK 1.5 之前**：Java 多线程编程主要依靠 `synchronized`、`wait()`、`notify()` 等原语，功能相对基础
+
 ### 1.2 JUC 的核心组件
+
+![](pngs\juc概览.png)
+
 ### 1.3 并发理论基础回顾（happens-before、内存模型）
+
+#### 1.3.1 happens-before
+
+​	Happens-Before 是 Java 内存模型中**定义操作之间内存可见性的偏序关系**。它是判断数据是否存在竞争、线程是否安全的主要依据。
+
+简单来说，**如果操作 A Happens-Before 操作 B，那么 A 的结果对 B 可见，且 A 的执行顺序排在 B 之前**。
+
+#### 1.3.2 内存模型
+
+​	Java内存模型（Java Memory Model，JMM）是 Java 并发编程的基础规范，它定义了**多线程程序中共享变量的访问规则**，以及**线程之间如何通过内存进行通信**。
+
+​	简单来说，JMM 解决了一个核心问题：**在多线程环境下，一个线程对共享变量的修改，何时对另一个线程可见**。
 
 ## 二、atomic 原子类源码分析
 ### 2.1 基础原子类（AtomicInteger / AtomicLong / AtomicBoolean）
 #### 2.1.1 源码结构：Unsafe 与 CAS 原理
+
+Unsafe 是 Java 提供的一个**提供底层硬件级别原子操作的类**，它位于 `sun.misc` 包下。这个类"不安全"是因为它允许 Java 程序直接操作内存，绕过了 Java 语言的安全检查。
+
+```java
+public class AtomicInteger extends Number implements java.io.Serializable {
+    // 获取 Unsafe 实例
+    private static final Unsafe U = Unsafe.getUnsafe();
+    
+    // 获取 value 字段的内存偏移量
+    private static final long VALUE = U.objectFieldOffset(AtomicInteger.class, "value");
+    
+    // volatile 修饰的值，保证可见性
+    private volatile int value;
+    
+    public final int incrementAndGet() {
+        // 调用 Unsafe 的 CAS 方法实现原子自增
+        return U.getAndAddInt(this, VALUE, 1) + 1;
+    }
+}
+```
+
+CAS 操作包含三个操作数：要更新的变量、更新前的预期值、要设置的新值
+
+```java
+@IntrinsicCandidate
+public final native int compareAndExchangeInt(Object o, long offset, int expected, int x);
+```
+
 #### 2.1.2 核心方法源码解读（getAndAddInt / compareAndSwapInt）
+
+```java
+/**
+ * 原子性地获取当前值并加上指定增量
+ * 
+ * @param o      要操作的对象（如 AtomicInteger 实例）
+ * @param offset 对象中value字段的内存偏移量
+ * @param delta  要增加的数值
+ * @return 增加前的原值
+ * 
+ * ⚠️ 注意：此方法内部包含【自旋操作】
+ *    - 使用 do-while 循环不断尝试，直到CAS成功
+ *    - 这是一种【乐观锁】的实现方式
+ *    - 在高竞争场景下可能循环多次，消耗CPU
+ */
+public final int getAndAddInt(Object o, long offset, int delta) {
+    int v;
+    do {
+        // 1. 获取当前值（volatile读，保证可见性）
+        v = getIntVolatile(o, offset);
+        
+        // 2. 尝试 CAS 更新
+        //    compareAndSwapInt 本身只尝试【一次】
+        //    但外层的 do-while 形成了【自旋】
+        //    失败就继续循环，直到成功为止
+    } while (!compareAndSwapInt(o, offset, v, v + delta));
+    
+    return v;  // 返回旧值
+}
+
+/**
+ * 比较并交换（Compare And Swap）
+ * 这是一个 native 方法，由 JVM 实现，最终调用 CPU 原子指令
+ * 
+ * @param o        对象
+ * @param offset   字段偏移量
+ * @param expected 期望值
+ * @param x        新值
+ * @return true 表示更新成功，false 表示失败（值已被其他线程修改）
+ * 
+ * ⚠️ 重要：这是一个【一次性操作】，内部【没有自旋】
+ *    - 执行一次 CPU 原子指令（如 x86 的 lock cmpxchg）
+ *    - 立即返回结果，不会重试
+ *    - 成功或失败都只尝试这一次
+ *    - 是否重试由上层代码决定
+ */
+public final native boolean compareAndSwapInt(
+    Object o,        // 对象
+    long offset,     // 字段偏移量
+    int expected,    // 期望值
+    int x            // 新值
+);
+```
+
 #### 2.1.3 流程示例：多线程下的自增
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class MultiThreadIncrementDemo {
+    
+    // 共享的原子变量，初始值为0
+    private static AtomicInteger counter = new AtomicInteger(0);
+    
+    public static void main(String[] args) {
+        // 创建3个线程，同时执行自增操作
+        for (int i = 1; i <= 3; i++) {
+            Thread t = new Thread(new IncrementTask(), "线程T" + i);
+            t.start();
+        }
+    }
+    
+    static class IncrementTask implements Runnable {
+        @Override
+        public void run() {
+            // 每个线程执行一次自增操作
+            int result = counter.incrementAndGet();
+            System.out.println(Thread.currentThread().getName() + 
+                             " 执行自增，结果为: " + result);
+        }
+    }
+}
+```
 
 ### 2.2 引用类型原子类（AtomicReference / AtomicStampedReference）
 #### 2.2.1 ABA 问题与解决方案
