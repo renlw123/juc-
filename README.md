@@ -141,10 +141,570 @@ public class MultiThreadIncrementDemo {
 
 ### 2.2 引用类型原子类（AtomicReference / AtomicStampedReference）
 #### 2.2.1 ABA 问题与解决方案
+
+ **每次成功的CAS（值真正改变时）都会创建新的Pair对象并替换旧的**
+ **CAS比较的是对象的内存地址，这正是ABA检测的关键**
+ **如果值没有改变，不会创建新对象，直接返回true**
+ **旧对象不再被引用后会被垃圾回收**
+
 #### 2.2.2 AtomicStampedReference 源码分析（版本号机制）
+
+```java
+package java.util.concurrent.atomic;
+
+public class AtomicStampedReference<V> {
+
+    /**
+     * 内部静态类，用于封装引用和戳记
+     * 使用不可变对象模式，所有字段都是final的
+     */
+    private static class Pair<T> {
+        final T reference;  // 对象引用，final保证不可变性
+        final int stamp;    // 整数戳记，final保证不可变性
+
+        /**
+         * 私有构造函数，只能通过of方法创建
+         * @param reference 引用对象
+         * @param stamp 戳记值
+         */
+        private Pair(T reference, int stamp) {
+            this.reference = reference;
+            this.stamp = stamp;
+        }
+
+        /**
+         * 静态工厂方法，创建新的Pair实例
+         * @param reference 引用对象
+         * @param stamp 戳记值
+         * @return 新的Pair对象
+         */
+        static <T> Pair<T> of(T reference, int stamp) {
+            return new Pair<T>(reference, stamp);
+        }
+    }
+
+    // volatile保证pair变量的可见性，所有线程都能看到最新值
+    private volatile Pair<V> pair;
+
+    /**
+     * 构造函数，使用给定的初始值创建AtomicStampedReference
+     *
+     * @param initialRef 初始引用
+     * @param initialStamp 初始戳记
+     */
+    public AtomicStampedReference(V initialRef, int initialStamp) {
+        // 使用Pair.of创建不可变对象
+        pair = Pair.of(initialRef, initialStamp);
+    }
+
+    /**
+     * 返回当前的引用值
+     * 由于pair是volatile的，这个读取操作是线程安全的
+     *
+     * @return 当前的引用值
+     */
+    public V getReference() {
+        return pair.reference;  // 直接返回当前pair的引用
+    }
+
+    /**
+     * 返回当前的戳记值
+     *
+     * @return 当前的戳记值
+     */
+    public int getStamp() {
+        return pair.stamp;  // 直接返回当前pair的戳记
+    }
+
+    /**
+     * 同时返回当前的引用和戳记值
+     * 典型用法：int[1] holder; ref = v.get(holder);
+     *
+     * @param stampHolder 至少大小为1的数组，返回时stampHolder[0]将保存戳记值
+     * @return 当前的引用值
+     */
+    public V get(int[] stampHolder) {
+        Pair<V> pair = this.pair;  // 一次性读取pair，保证一致性
+        stampHolder[0] = pair.stamp;  // 将戳记存入数组
+        return pair.reference;  // 返回引用
+    }
+
+    /**
+     * 弱比较并设置，可能虚假失败，不提供排序保证
+     * 很少作为compareAndSet的替代方案
+     *
+     * @param expectedReference 期望的引用值
+     * @param newReference 新的引用值
+     * @param expectedStamp 期望的戳记值
+     * @param newStamp 新的戳记值
+     * @return 是否成功
+     */
+    public boolean weakCompareAndSet(V   expectedReference,
+                                     V   newReference,
+                                     int expectedStamp,
+                                     int newStamp) {
+        // 直接调用compareAndSet，当前实现中没有区别
+        return compareAndSet(expectedReference, newReference,
+                expectedStamp, newStamp);
+    }
+
+    /**
+     * 原子性地设置引用和戳记值
+     * 只有当当前引用==期望引用且当前戳记==期望戳记时才更新
+     *
+     * @param expectedReference 期望的引用值
+     * @param newReference 新的引用值
+     * @param expectedStamp 期望的戳记值
+     * @param newStamp 新的戳记值
+     * @return 是否成功
+     */
+    public boolean compareAndSet(V   expectedReference,
+                                 V   newReference,
+                                 int expectedStamp,
+                                 int newStamp) {
+        Pair<V> current = pair;  // 获取当前pair
+        return
+                // 第一步：检查引用是否匹配（使用==比较，而不是equals）
+                expectedReference == current.reference &&
+                        // 第二步：检查戳记是否匹配
+                        expectedStamp == current.stamp &&
+                        // 第三步：如果新值和当前值完全相同，直接返回true
+                        ((newReference == current.reference &&
+                                newStamp == current.stamp) ||
+                                // 否则，尝试CAS更新pair
+                                casPair(current, Pair.of(newReference, newStamp)));
+    }
+
+    /**
+     * 无条件设置引用和戳记值
+     * 注意：这个方法不是原子的，可能与其他操作产生竞态条件
+     *
+     * @param newReference 新的引用值
+     * @param newStamp 新的戳记值
+     */
+    public void set(V newReference, int newStamp) {
+        Pair<V> current = pair;  // 获取当前pair
+        // 只有当值真正改变时才更新（优化，避免不必要的对象创建）
+        if (newReference != current.reference || newStamp != current.stamp)
+            this.pair = Pair.of(newReference, newStamp);  // 创建新Pair并赋值
+    }
+
+    /**
+     * 原子性地设置戳记值，但要求引用必须匹配期望值
+     * 这个方法可能虚假失败，但最终会成功
+     *
+     * @param expectedReference 期望的引用值
+     * @param newStamp 新的戳记值
+     * @return 是否成功
+     */
+    public boolean attemptStamp(V expectedReference, int newStamp) {
+        Pair<V> current = pair;  // 获取当前pair
+        return
+                // 检查引用是否匹配
+                expectedReference == current.reference &&
+                        // 如果戳记已经是要设置的值，直接成功；否则尝试CAS更新
+                        (newStamp == current.stamp ||
+                                casPair(current, Pair.of(expectedReference, newStamp)));
+    }
+
+    // Unsafe 底层操作机制 ------------------------------------------------
+
+    // 获取Unsafe实例，用于执行底层CAS操作
+    private static final sun.misc.Unsafe UNSAFE = sun.misc.Unsafe.getUnsafe();
+    // 计算pair字段的内存偏移量
+    private static final long pairOffset =
+            objectFieldOffset(UNSAFE, "pair", AtomicStampedReference.class);
+
+    /**
+     * CAS更新pair字段
+     * @param cmp 期望的旧值
+     * @param val 要设置的新值
+     * @return 是否成功
+     */
+    private boolean casPair(Pair<V> cmp, Pair<V> val) {
+        // 使用Unsafe的compareAndSwapObject执行原子CAS操作,注意这里比较的是pair的内存地址
+        return UNSAFE.compareAndSwapObject(this, pairOffset, cmp, val);
+    }
+
+    /**
+     * 获取字段的内存偏移量
+     * @param UNSAFE Unsafe实例
+     * @param field 字段名
+     * @param klazz 类对象
+     * @return 字段偏移量
+     */
+    static long objectFieldOffset(sun.misc.Unsafe UNSAFE,
+                                  String field, Class<?> klazz) {
+        try {
+            // 通过反射获取字段的偏移量
+            return UNSAFE.objectFieldOffset(klazz.getDeclaredField(field));
+        } catch (NoSuchFieldException e) {
+            // 将异常转换为对应的Error
+            NoSuchFieldError error = new NoSuchFieldError(field);
+            error.initCause(e);
+            throw error;
+        }
+    }
+}
+```
+
+
 
 ### 2.3 原子数组（AtomicIntegerArray / AtomicLongArray）
 #### 2.3.1 内部实现：对数组元素的 CAS 操作
+
+```java
+package java.util.concurrent.atomic;
+
+import java.util.function.IntUnaryOperator;
+import java.util.function.IntBinaryOperator;
+
+import sun.misc.Unsafe;
+
+/**
+ * 一个可以原子方式更新元素的 {@code int} 数组。
+ * 
+ * 理解：array没有使用volatile修饰，并不能保证读取数组的可见性，所以读取数组的
+ * 元素的一些方法的可见性都是通过Unsafe类的cas方法来保证的，不像AtomicInteger
+ *      public final int get() {
+ *         return value;
+ *     }
+ * 可以直接拿去value的值，因为AtomicInteger的value是通过volatile修饰的
+ */
+public class AtomicIntegerArray implements java.io.Serializable {
+    private static final long serialVersionUID = 2862133569453604235L;
+
+    // 获取Unsafe实例，用于底层原子操作
+    private static final Unsafe unsafe = Unsafe.getUnsafe();
+    // 获取int数组第一个元素的起始偏移量
+    private static final int base = unsafe.arrayBaseOffset(int[].class);
+    // 用于计算元素在内存中的偏移量
+    private static final int shift;
+    // 存储数据的数组，注意：这里不是volatile修饰的
+    private final int[] array;
+
+    static {
+        // 获取数组中一个元素占用的字节数
+        int scale = unsafe.arrayIndexScale(int[].class);
+        // 确保scale是2的幂次方（这是位运算寻址的要求）
+        if ((scale & (scale - 1)) != 0) throw new Error("数据类型大小不是2的幂次方");
+        // 计算移位位数，用于快速计算元素偏移量
+        shift = 31 - Integer.numberOfLeadingZeros(scale);
+    }
+
+    /**
+     * 检查索引是否越界，并返回该索引对应的内存偏移量
+     *
+     * @param i 数组索引
+     * @return 内存偏移量
+     * @throws IndexOutOfBoundsException 如果索引越界
+     */
+    private long checkedByteOffset(int i) {
+        if (i < 0 || i >= array.length) throw new IndexOutOfBoundsException("索引 " + i);
+
+        return byteOffset(i);
+    }
+
+    /**
+     * 计算给定索引对应的内存偏移量
+     * 公式: base + i * scale，通过位运算优化
+     *
+     * @param i 数组索引
+     * @return 内存偏移量
+     */
+    private static long byteOffset(int i) {
+        return ((long) i << shift) + base;
+    }
+
+    /**
+     * 创建一个指定长度的 AtomicIntegerArray，所有元素初始值为0。
+     *
+     * @param length 数组长度
+     */
+    public AtomicIntegerArray(int length) {
+        array = new int[length];
+    }
+
+    /**
+     * 创建一个与给定数组长度相同、元素全部复制的 AtomicIntegerArray。
+     *
+     * @param array 要复制元素的源数组
+     * @throws NullPointerException 如果源数组为null
+     */
+    public AtomicIntegerArray(int[] array) {
+        // final字段保证了可见性
+        // volatile只能保证数组引用的可见性，不能保证数组元素的可见性，所以这类没有使用volatile修饰数组
+        // 而是使用原子类的set/get
+        this.array = array.clone();
+    }
+
+    /**
+     * 返回数组的长度。
+     *
+     * @return 数组长度
+     */
+    public final int length() {
+        return array.length;
+    }
+
+    /**
+     * 获取位置 {@code i} 的当前值。
+     *
+     * @param i 索引
+     * @return 当前值
+     */
+    public final int get(int i) {
+        return getRaw(checkedByteOffset(i));
+    }
+
+    /**
+     * 使用volatile语义从指定内存偏移量读取值
+     *
+     * @param offset 内存偏移量
+     * @return 当前值
+     */
+    private int getRaw(long offset) {
+        return unsafe.getIntVolatile(array, offset);
+    }
+
+    /**
+     * 将位置 {@code i} 的元素设置为指定值。
+     *
+     * @param i        索引
+     * @param newValue 新值
+     */
+    public final void set(int i, int newValue) {
+        unsafe.putIntVolatile(array, checkedByteOffset(i), newValue);
+    }
+
+    /**
+     * 最终将位置 {@code i} 的元素设置为指定值。
+     * (非volatile顺序的写入，性能更高但可见性保证较弱)
+     *
+     * @param i        索引
+     * @param newValue 新值
+     * @since 1.6
+     */
+    public final void lazySet(int i, int newValue) {
+        unsafe.putOrderedInt(array, checkedByteOffset(i), newValue);
+    }
+
+    /**
+     * 原子地将位置 {@code i} 的元素设置为给定值，并返回旧值。
+     *
+     * @param i        索引
+     * @param newValue 新值
+     * @return 之前的值
+     */
+    public final int getAndSet(int i, int newValue) {
+        return unsafe.getAndSetInt(array, checkedByteOffset(i), newValue);
+    }
+
+    /**
+     * 如果位置 {@code i} 的当前值 {@code ==} 预期值，则原子地将其设置为给定的更新值。
+     *
+     * @param i      索引
+     * @param expect 预期值
+     * @param update 新值
+     * @return 如果成功返回 {@code true}。返回false表示实际值不等于预期值。
+     */
+    public final boolean compareAndSet(int i, int expect, int update) {
+        return compareAndSetRaw(checkedByteOffset(i), expect, update);
+    }
+
+    /**
+     * 在指定内存偏移量执行CAS操作
+     *
+     * @param offset 内存偏移量
+     * @param expect 预期值
+     * @param update 新值
+     * @return 是否成功
+     */
+    private boolean compareAndSetRaw(long offset, int expect, int update) {
+        return unsafe.compareAndSwapInt(array, offset, expect, update);
+    }
+
+    /**
+     * 如果位置 {@code i} 的当前值 {@code ==} 预期值，则原子地将其设置为给定的更新值。
+     *
+     * <p><a href="package-summary.html#weakCompareAndSet">可能会虚假失败且不提供排序保证</a>，
+     * 因此很少作为 {@code compareAndSet} 的合适替代方案。
+     *
+     * @param i      索引
+     * @param expect 预期值
+     * @param update 新值
+     * @return 如果成功返回 {@code true}
+     */
+    public final boolean weakCompareAndSet(int i, int expect, int update) {
+        return compareAndSet(i, expect, update);
+    }
+
+    /**
+     * 原子地将索引 {@code i} 的元素加1。
+     *
+     * @param i 索引
+     * @return 之前的值
+     */
+    public final int getAndIncrement(int i) {
+        return getAndAdd(i, 1);
+    }
+
+    /**
+     * 原子地将索引 {@code i} 的元素减1。
+     *
+     * @param i 索引
+     * @return 之前的值
+     */
+    public final int getAndDecrement(int i) {
+        return getAndAdd(i, -1);
+    }
+
+    /**
+     * 原子地将给定值与索引 {@code i} 的元素相加。
+     *
+     * @param i     索引
+     * @param delta 要加的值
+     * @return 之前的值
+     */
+    public final int getAndAdd(int i, int delta) {
+        return unsafe.getAndAddInt(array, checkedByteOffset(i), delta);
+    }
+
+    /**
+     * 原子地将索引 {@code i} 的元素加1。
+     *
+     * @param i 索引
+     * @return 更新后的值
+     */
+    public final int incrementAndGet(int i) {
+        return getAndAdd(i, 1) + 1;
+    }
+
+    /**
+     * 原子地将索引 {@code i} 的元素减1。
+     *
+     * @param i 索引
+     * @return 更新后的值
+     */
+    public final int decrementAndGet(int i) {
+        return getAndAdd(i, -1) - 1;
+    }
+
+    /**
+     * 原子地将给定值与索引 {@code i} 的元素相加。
+     *
+     * @param i     索引
+     * @param delta 要加的值
+     * @return 更新后的值
+     */
+    public final int addAndGet(int i, int delta) {
+        return getAndAdd(i, delta) + delta;
+    }
+
+
+    /**
+     * 原子地使用给定函数对索引 {@code i} 的元素进行更新，并返回之前的值。
+     * 函数应该是无副作用的，因为当线程竞争导致更新失败时可能会重新应用。
+     *
+     * @param i              索引
+     * @param updateFunction 无副作用的更新函数
+     * @return 之前的值
+     * @since 1.8
+     */
+    public final int getAndUpdate(int i, IntUnaryOperator updateFunction) {
+        long offset = checkedByteOffset(i);
+        int prev, next;
+        do {
+            prev = getRaw(offset);
+            next = updateFunction.applyAsInt(prev);
+        } while (!compareAndSetRaw(offset, prev, next));
+        return prev;
+    }
+
+    /**
+     * 原子地使用给定函数对索引 {@code i} 的元素进行更新，并返回更新后的值。
+     * 函数应该是无副作用的，因为当线程竞争导致更新失败时可能会重新应用。
+     *
+     * @param i              索引
+     * @param updateFunction 无副作用的更新函数
+     * @return 更新后的值
+     * @since 1.8
+     */
+    public final int updateAndGet(int i, IntUnaryOperator updateFunction) {
+        long offset = checkedByteOffset(i);
+        int prev, next;
+        do {
+            prev = getRaw(offset);
+            next = updateFunction.applyAsInt(prev);
+        } while (!compareAndSetRaw(offset, prev, next));
+        return next;
+    }
+
+    /**
+     * 原子地将给定函数应用于索引 {@code i} 的当前值和给定值，并返回之前的值。
+     * 函数以当前值作为第一个参数，给定更新值作为第二个参数。
+     * 函数应该是无副作用的，因为当线程竞争导致更新失败时可能会重新应用。
+     *
+     * @param i                   索引
+     * @param x                   更新值
+     * @param accumulatorFunction 无副作用的二元累积函数
+     * @return 之前的值
+     * @since 1.8
+     */
+    public final int getAndAccumulate(int i, int x, IntBinaryOperator accumulatorFunction) {
+        long offset = checkedByteOffset(i);
+        int prev, next;
+        do {
+            prev = getRaw(offset);
+            next = accumulatorFunction.applyAsInt(prev, x);
+        } while (!compareAndSetRaw(offset, prev, next));
+        return prev;
+    }
+
+    /**
+     * 原子地将给定函数应用于索引 {@code i} 的当前值和给定值，并返回更新后的值。
+     * 函数以当前值作为第一个参数，给定更新值作为第二个参数。
+     * 函数应该是无副作用的，因为当线程竞争导致更新失败时可能会重新应用。
+     *
+     * @param i                   索引
+     * @param x                   更新值
+     * @param accumulatorFunction 无副作用的二元累积函数
+     * @return 更新后的值
+     * @since 1.8
+     */
+    public final int accumulateAndGet(int i, int x, IntBinaryOperator accumulatorFunction) {
+        long offset = checkedByteOffset(i);
+        int prev, next;
+        do {
+            prev = getRaw(offset);
+            next = accumulatorFunction.applyAsInt(prev, x);
+        } while (!compareAndSetRaw(offset, prev, next));
+        return next;
+    }
+
+    /**
+     * 返回数组当前值的字符串表示形式。
+     *
+     * @return 数组当前值的字符串表示形式
+     */
+    public String toString() {
+        int iMax = array.length - 1;
+        if (iMax == -1) return "[]";
+
+        StringBuilder b = new StringBuilder();
+        b.append('[');
+        for (int i = 0; ; i++) {
+            // 使用volatile读获取当前值，保证获取到的是最新的值
+            b.append(getRaw(byteOffset(i)));
+            if (i == iMax) return b.append(']').toString();
+            b.append(',').append(' ');
+        }
+    }
+
+}
+```
+
+
 
 ### 2.4 字段更新器（AtomicIntegerFieldUpdater）
 #### 2.4.1 原理与使用限制
