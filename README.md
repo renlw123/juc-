@@ -709,9 +709,450 @@ public class AtomicIntegerArray implements java.io.Serializable {
 ### 2.4 字段更新器（AtomicIntegerFieldUpdater）
 #### 2.4.1 原理与使用限制
 
+```java
+public abstract class AtomicIntegerFieldUpdater<T> {
+
+
+    @CallerSensitive  // 标记该方法对调用者敏感（用于权限检查）
+    public static <U> AtomicIntegerFieldUpdater<U> newUpdater(Class<U> tclass,
+                                                              String fieldName) {
+        // 创建实现类，传入调用者类用于访问权限检查
+        return new AtomicIntegerFieldUpdaterImpl<U>
+                (tclass, fieldName, Reflection.getCallerClass());
+    }
+
+    /**
+     * Protected do-nothing constructor for use by subclasses.
+     * 受保护的空构造方法，供子类使用。
+     */
+    protected AtomicIntegerFieldUpdater() {
+    }
+
+
+    @SuppressWarnings("removal")
+    AtomicIntegerFieldUpdaterImpl(final Class<T> tclass,
+                                  final String fieldName,
+                                  final Class<?> caller) {
+        final Field field;
+        final int   modifiers;
+        try {
+            // 在特权模式下获取字段（绕过访问权限检查）
+            field = AccessController.doPrivileged(
+                    new PrivilegedExceptionAction<Field>() {
+                        public Field run() throws NoSuchFieldException {
+                            return tclass.getDeclaredField(fieldName);
+                        }
+                    });
+            modifiers = field.getModifiers();  // 获取字段修饰符
+
+            // 确保调用者有访问该字段的权限
+            sun.reflect.misc.ReflectUtil.ensureMemberAccess(
+                    caller, tclass, null, modifiers);
+
+            // 检查类加载器权限
+            ClassLoader cl  = tclass.getClassLoader();
+            ClassLoader ccl = caller.getClassLoader();
+            if ((ccl != null) && (ccl != cl) &&
+                    ((cl == null) || !isAncestor(cl, ccl))) {
+                sun.reflect.misc.ReflectUtil.checkPackageAccess(tclass);
+            }
+        } catch (PrivilegedActionException pae) {
+            throw new RuntimeException(pae.getException());
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
+        }
+
+        // 检查字段类型是否为int
+        if (field.getType() != int.class)
+            throw new IllegalArgumentException("Must be integer type");
+
+        // 检查字段是否为volatile
+        if (!Modifier.isVolatile(modifiers))
+            throw new IllegalArgumentException("Must be volatile type");
+
+        // 处理protected字段的访问限制
+        // 如果字段是protected，且调用者不是同一个包，则限制接收者类型为调用者类
+        this.cclass = (Modifier.isProtected(modifiers) &&
+                tclass.isAssignableFrom(caller) &&
+                !isSamePackage(tclass, caller))
+                ? caller : tclass;
+        this.tclass = tclass;
+        // 获取字段的内存偏移量（用于Unsafe操作）
+        this.offset = U.objectFieldOffset(field);
+    }
+
+
+    /**
+     * Atomically increments by one the current value.
+     * 原子地将当前值加1并返回新值。
+     */
+    public int incrementAndGet(T obj) {
+        int prev, next;
+        do {
+            prev = get(obj);
+            next = prev + 1;
+        } while (!compareAndSet(obj, prev, next));
+        return next;
+    }
+
+
+}
+```
+
+
+
+```java
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+
+public class AtomicIntegerFieldUpdaterCounter {
+
+    // 要累加的类
+    static class Counter {
+        private volatile int count;  // 必须用volatile修饰
+        private String name;
+
+        public Counter(String name) {
+            this.name = name;
+            this.count = 0;
+        }
+
+        public int getCount() {
+            return count;
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Counter{name='%s', count=%d}", name, count);
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        // 创建更新器
+        AtomicIntegerFieldUpdater<Counter> updater =
+                AtomicIntegerFieldUpdater.newUpdater(Counter.class, "count");
+
+        Counter counter = new Counter("测试计数器");
+
+        int threadCount = 10;
+        int incrementsPerThread = 100000;
+
+        CountDownLatch latch = new CountDownLatch(threadCount);
+        ExecutorService executor = Executors.newFixedThreadPool(threadCount);
+
+        long startTime = System.currentTimeMillis();
+
+        // 启动多个线程并发累加
+        for (int i = 0; i < threadCount; i++) {
+            executor.submit(() -> {
+                try {
+                    for (int j = 0; j < incrementsPerThread; j++) {
+                        // 原子性累加
+                        updater.incrementAndGet(counter);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+
+        latch.await();
+        executor.shutdown();
+
+        long endTime = System.currentTimeMillis();
+
+        int expected = threadCount * incrementsPerThread;
+        System.out.println("累加完成后的计数: " + counter);
+        System.out.println("期望值: " + expected);
+        System.out.println("实际值: " + counter.getCount());
+        System.out.println("结果正确: " + (expected == counter.getCount()));
+        System.out.println("耗时: " + (endTime - startTime) + "ms");
+    }
+}
+```
+
+
+
 ### 2.5 累加器（LongAdder / DoubleAdder）
 #### 2.5.1 与 AtomicLong 对比
+
+| 维度         | AtomicLong           | LongAdder          |
+| :----------- | :------------------- | :----------------- |
+| **核心优势** | 精确控制、内存小     | 高并发吞吐量大     |
+| **核心劣势** | 高竞争性能差         | 内存大、非实时     |
+| **最佳实践** | ID生成、限流、信号量 | 统计计数、监控指标 |
+| **读频率**   | 读写均衡             | 读少写多           |
+| **一致性**   | 强一致性             | 最终一致性         |
+
 #### 2.5.2 源码解析：分段累加与最终求和
+
+```java
+package java.util.concurrent.atomic;
+
+import java.io.Serializable;
+
+/**
+ * 当多个线程更新一个用于统计等目的的共同和（而非细粒度同步控制）时，
+ * 这个类通常比AtomicLong更优。
+ */
+public class LongAdder extends Striped64 implements Serializable {
+    private static final long serialVersionUID = 7249069246863182397L;
+
+    /**
+     * 创建一个新的累加器，初始和为0。
+     */
+    public LongAdder() {
+    }
+
+    /**
+     * 添加给定的值。
+     *
+     * @param x the value to add 要添加的值
+     */
+    public void add(long x) {
+        // cells: 单元格数组（父类Striped64中的字段）
+        // base: 基础值（父类中的字段，当没有竞争时使用）
+        Cell[] cs; long b, v; int m; Cell c;
+
+        // 如果cells不为空（已有竞争），或者CAS更新base失败（出现竞争），进入分支
+        if ((cs = cells) != null || !casBase(b = base, b + x)) {
+            int index = getProbe();  // 获取当前线程的探针值（用于哈希到具体cell）
+            boolean uncontended = true;  // 是否无竞争标志
+
+            // 判断条件：
+            // cs == null: cells数组未初始化
+            // (m = cs.length - 1) < 0: cells数组长度为0
+            // (c = cs[index & m]) == null: 当前线程对应的cell为null
+            // !(uncontended = c.cas(v = c.value, v + x)): CAS更新cell失败
+            if (cs == null || (m = cs.length - 1) < 0 ||
+                    (c = cs[index & m]) == null ||
+                    !(uncontended = c.cas(v = c.value, v + x)))
+                // 调用父类的longAccumulate方法进行扩容或重试
+                longAccumulate(x, null, uncontended, index);// cells 也是在这里进行初始化的（大小为 2）
+        }
+    }
+
+    /**
+     * 等同于add(1)。
+     */
+    public void increment() {
+        add(1L);
+    }
+
+    /**
+     * 等同于add(-1)。
+     */
+    public void decrement() {
+        add(-1L);
+    }
+
+    /**
+     * 返回当前总和。返回值不是原子快照；
+     * 计算过程中发生的并发更新可能不会被包含在内。
+     *
+     * @return the sum 总和
+     */
+    public long sum() {
+        Cell[] cs = cells;
+        long sum = base;  // 从base开始
+        if (cs != null) {
+            // 遍历所有cell，累加它们的值
+            for (Cell c : cs)
+                if (c != null)
+                    sum += c.value;
+        }
+        return sum;
+    }
+
+    /**
+     * 将维护总和的所有变量重置为0。如果没有并发更新，这个方法可以替代创建新的累加器。
+     */
+    public void reset() {
+        Cell[] cs = cells;
+        base = 0L;  // 重置base
+        if (cs != null) {
+            // 重置所有cell
+            for (Cell c : cs)
+                if (c != null)
+                    c.reset();
+        }
+    }
+
+    /**
+     * 相当于先sum()再reset()。可用于多线程计算之间的静默点。
+     *
+     * @return the sum 总和
+     */
+    public long sumThenReset() {
+        Cell[] cs = cells;
+        long sum = getAndSetBase(0L);  // 原子地设置base为0并返回旧值
+        if (cs != null) {
+            // 遍历所有cell，累加并重置
+            for (Cell c : cs) {
+                if (c != null)
+                    sum += c.getAndSet(0L);  // 原子地设置cell为0并返回旧值
+            }
+        }
+        return sum;
+    }
+
+    /**
+     * 返回sum()的字符串表示。
+     */
+    public String toString() {
+        return Long.toString(sum());
+    }
+
+    /**
+     * 等同于sum()。
+     *
+     * @return the sum 总和
+     */
+    public long longValue() {
+        return sum();
+    }
+
+    /**
+     * 返回sum()的int类型值（窄化转换）。
+     */
+    public int intValue() {
+        return (int)sum();
+    }
+
+    /**
+     * 返回sum()的float类型值（加宽转换）。
+     */
+    public float floatValue() {
+        return (float)sum();
+    }
+
+    /**
+     * 返回sum()的double类型值（加宽转换）。
+     */
+    public double doubleValue() {
+        return (double)sum();
+    }
+
+    /**
+     * 序列化代理，用于避免在序列化形式中引用非公共的Striped64父类。
+     */
+    private static class SerializationProxy implements Serializable {
+        private static final long serialVersionUID = 7249069246863182397L;
+
+        /**
+         * sum()返回的当前值。
+         * @serial
+         */
+        private final long value;
+
+        SerializationProxy(LongAdder a) {
+            value = a.sum();
+        }
+
+        /**
+         * 返回一个具有此代理所保存初始状态的LongAdder对象。
+         */
+        private Object readResolve() {
+            LongAdder a = new LongAdder();
+            a.base = value;  // 只设置base，因为反序列化时不会有竞争
+            return a;
+        }
+    }
+
+    /**
+     * 返回表示此实例状态的SerializationProxy。
+     */
+    private Object writeReplace() {
+        return new SerializationProxy(this);
+    }
+
+    /**
+     * @throws java.io.InvalidObjectException always
+     */
+    private void readObject(java.io.ObjectInputStream s)
+            throws java.io.InvalidObjectException {
+        // 禁止直接反序列化，必须通过代理
+        throw new java.io.InvalidObjectException("Proxy required");
+    }
+}
+```
+
+```java
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.*;
+
+public class LongAdderMultithreadExample {
+
+    // 模拟网站访问统计
+    static class WebsiteCounter {
+        // 使用LongAdder替代AtomicLong
+        private final LongAdder pageViewCount = new LongAdder();
+        private final LongAdder uniqueIpCount = new LongAdder();
+        private final ConcurrentHashMap<String, Boolean> visitedIps = new ConcurrentHashMap<>();
+
+        // 记录页面访问
+        public void recordVisit(String ip) {
+            pageViewCount.increment();  // 页面访问量+1
+
+            // 记录独立IP
+            visitedIps.computeIfAbsent(ip, k -> {
+                uniqueIpCount.increment();  // 新IP才增加
+                return true;
+            });
+        }
+
+        public long getPageViews() {
+            return pageViewCount.sum();
+        }
+
+        public long getUniqueIps() {
+            return uniqueIpCount.sum();
+        }
+
+        public void reset() {
+            pageViewCount.reset();
+            uniqueIpCount.reset();
+            visitedIps.clear();
+        }
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        WebsiteCounter counter = new WebsiteCounter();
+        int threadCount = 50;
+        int visitsPerThread = 10000;
+
+        // 模拟50个线程，每个线程访问10000次
+        List<Thread> threads = new ArrayList<>();
+
+        for (int i = 0; i < threadCount; i++) {
+            String threadIp = "192.168.1." + (i % 10);  // 只有10个不同的IP
+            Thread t = new Thread(() -> {
+                for (int j = 0; j < visitsPerThread; j++) {
+                    counter.recordVisit(threadIp);
+                }
+            });
+            threads.add(t);
+            t.start();
+        }
+
+        // 等待所有线程完成
+        for (Thread t : threads) {
+            t.join();
+        }
+
+        System.out.println("=== 网站访问统计 ===");
+        System.out.println("总访问量 (PV): " + counter.getPageViews());
+        System.out.println("独立IP数 (UV): " + counter.getUniqueIps());
+        System.out.println("期望PV: " + (threadCount * visitsPerThread));
+        System.out.println("期望UV: 10");
+    }
+}
+```
+
+
 
 ## 三、locks 锁框架源码分析
 ### 3.1 抽象队列同步器 AQS（AbstractQueuedSynchronizer）
